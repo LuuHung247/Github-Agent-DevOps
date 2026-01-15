@@ -1,0 +1,13 @@
+{
+    "mcpServers": {
+        "github-admin": {
+            "command": "/home/hunglk/.local/bin/uv",
+            "args": [
+                "--directory",
+                "/home/hunglk/Documents/VSCode/osp/user-repo-agent",
+                "run",
+                "mcp_admin.py"
+            ]
+        }
+    }
+}
