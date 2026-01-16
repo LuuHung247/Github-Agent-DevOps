@@ -1,0 +1,8 @@
+2026-01-16 10:10:42,315 | INFO | {"timestamp": "2026-01-16T03:10:42.315078", "caller": "unknown", "action": "add_collaborator", "success": false, "details": {"reason": "unauthorized_caller"}}
+2026-01-16 10:10:47,139 | INFO | {"timestamp": "2026-01-16T03:10:47.139378", "caller": "unknown", "action": "remove_collaborator", "success": false, "details": {"reason": "unauthorized_caller"}}
+2026-01-16 10:12:27,409 | INFO | {"timestamp": "2026-01-16T03:12:27.409860", "caller": "unknown", "action": "add_collaborator", "success": false, "details": {"reason": "unauthorized_caller"}}
+2026-01-16 10:14:25,657 | INFO | {"timestamp": "2026-01-16T03:14:25.657359", "caller": "unknown", "action": "remove_collaborator", "success": false, "details": {"reason": "unauthorized_caller"}}
+2026-01-16 10:14:25,749 | INFO | {"timestamp": "2026-01-16T03:14:25.749716", "caller": "unknown", "action": "remove_collaborator", "success": false, "details": {"reason": "unauthorized_caller"}}
+2026-01-16 10:17:10,496 | INFO | {"timestamp": "2026-01-16T03:17:10.496835", "caller": "unknown", "action": "remove_collaborator", "success": false, "details": {"reason": "unauthorized_caller"}}
+2026-01-16 10:37:04,543 | INFO | {"timestamp": "2026-01-16T03:37:04.542958", "caller": "LuuHung247", "action": "remove_collaborator", "success": true, "details": {"owner": "LuuHung247", "repo": "EduConnect-Helm", "username": "hunglk-osp"}}
+2026-01-16 10:39:28,314 | INFO | {"timestamp": "2026-01-16T03:39:28.314117", "caller": "LuuHung247", "action": "add_collaborator", "success": true, "details": {"owner": "LuuHung247", "repo": "EduConnect-Helm", "username": "hunglk-osp", "permission": "push"}}
