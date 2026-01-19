@@ -13,7 +13,6 @@ import httpx
 import os
 import asyncio
 import logging
-import hashlib
 import time
 import re
 import json
@@ -96,7 +95,7 @@ class ToolResult:
 
 class GitHubClient:
     """
-    GitHub API client with caching and automatic owner detection.
+    GitHub API client with automatic owner detection.
 
     Handles both personal accounts and organizations transparently.
     """
@@ -107,8 +106,6 @@ class GitHubClient:
             raise ValueError("GITHUB_TOKEN environment variable is required")
 
         self.base_url = "https://api.github.com"
-        self._cache: Dict[str, tuple] = {}
-        self._cache_ttl = 300
         self._token_owner: Optional[str] = None
         self._token_scopes: Optional[List[str]] = None
         self._owner_type_cache: Dict[str, str] = {}
@@ -179,33 +176,14 @@ class GitHubClient:
 
         return "User"
 
-    def _cache_key(self, endpoint: str, params: Dict = None) -> str:
-        params_str = json.dumps(params or {}, sort_keys=True)
-        return hashlib.md5(f"{endpoint}:{params_str}".encode()).hexdigest()
-
-    def invalidate_cache(self, pattern: str = None):
-        if pattern is None:
-            self._cache.clear()
-        else:
-            self._cache = {k: v for k, v in self._cache.items() if pattern not in k}
-
     async def request(
         self,
         method: str,
         endpoint: str,
         params: Dict = None,
-        json_data: Dict = None,
-        use_cache: bool = True
+        json_data: Dict = None
     ) -> ToolResult:
-        """Execute GitHub API request with caching support."""
-
-        if method == "GET" and use_cache:
-            key = self._cache_key(endpoint, params)
-            if key in self._cache:
-                data, timestamp = self._cache[key]
-                if time.time() - timestamp < self._cache_ttl:
-                    return ToolResult(success=True, data=data)
-
+        """Execute GitHub API request."""
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.request(
@@ -239,9 +217,6 @@ class GitHubClient:
                     )
 
                 data = response.json() if response.text else {}
-
-                if method == "GET" and use_cache:
-                    self._cache[self._cache_key(endpoint, params)] = (data, time.time())
 
                 return ToolResult(success=True, data=data)
 
@@ -612,6 +587,116 @@ async def list_all_collaborators(max_repos: int = 20) -> List[TextContent]:
 
 
 @mcp.tool()
+async def list_pending_invitations(owner: str, repo: str) -> List[TextContent]:
+    """
+    List pending invitations for a specific repository.
+
+    Args:
+        owner: Repository owner
+        repo: Repository name
+    """
+    if not validate_username(owner) or not validate_repo_name(repo):
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid owner or repository name"
+        ).to_response()
+
+    result = await github.request(
+        "GET",
+        f"/repos/{owner}/{repo}/invitations",
+        params={"per_page": 100}
+    )
+
+    if not result.success:
+        return result.to_response()
+
+    invitations = [{
+        "id": inv["id"],
+        "invitee": inv.get("invitee", {}).get("login", "unknown"),
+        "inviter": inv.get("inviter", {}).get("login", "unknown"),
+        "permissions": inv.get("permissions", "unknown"),
+        "created_at": inv.get("created_at", ""),
+        "url": inv.get("html_url", "")
+    } for inv in result.data]
+
+    return ToolResult(success=True, data={
+        "repository": f"{owner}/{repo}",
+        "total": len(invitations),
+        "pending_invitations": invitations
+    }).to_response()
+
+
+@mcp.tool()
+async def list_all_pending_invitations(max_repos: int = 20) -> List[TextContent]:
+    """
+    List ALL pending invitations across all repositories (for periodic review).
+
+    Args:
+        max_repos: Max repos to check (default: 20, max: 50)
+    """
+    max_repos = min(max(1, max_repos), 50)
+
+    # Get token owner info
+    token_info = await github.get_token_info()
+    if not token_info.success:
+        return token_info.to_response()
+
+    owner = token_info.data["owner"]
+
+    # Get list of repos
+    repos_result = await github.request(
+        "GET",
+        f"/users/{owner}/repos",
+        params={"type": "owner", "per_page": max_repos, "sort": "updated"}
+    )
+
+    if not repos_result.success:
+        return repos_result.to_response()
+
+    repos = repos_result.data
+    invitations_by_repo = []
+    total_invitations = 0
+    repos_with_invitations = []
+
+    # Get invitations for each repo
+    for repo_data in repos:
+        repo_name = repo_data["name"]
+
+        result = await github.request(
+            "GET",
+            f"/repos/{owner}/{repo_name}/invitations",
+            params={"per_page": 100}
+        )
+
+        if result.success and result.data:
+            invitations = [{
+                "id": inv["id"],
+                "invitee": inv.get("invitee", {}).get("login", "unknown"),
+                "inviter": inv.get("inviter", {}).get("login", "unknown"),
+                "permissions": inv.get("permissions", "unknown"),
+                "created_at": inv.get("created_at", "")
+            } for inv in result.data]
+
+            if invitations:
+                repos_with_invitations.append(repo_name)
+                total_invitations += len(invitations)
+                invitations_by_repo.append({
+                    "repository": f"{owner}/{repo_name}",
+                    "invitation_count": len(invitations),
+                    "invitations": invitations
+                })
+
+    return ToolResult(success=True, data={
+        "owner": owner,
+        "total_invitations": total_invitations,
+        "repos_checked": len(repos),
+        "repos_with_invitations": repos_with_invitations,
+        "invitations_by_repo": invitations_by_repo
+    }).to_response()
+
+
+@mcp.tool()
 @protected
 async def add_collaborator(
     owner: str,
@@ -671,8 +756,6 @@ async def add_collaborator(
     if not result.success:
         return result.to_response()
 
-    github.invalidate_cache(f"{owner}/{repo}")
-
     response_data = {
         "action": "invitation_sent",
         "repository": f"{owner}/{repo}",
@@ -685,6 +768,46 @@ async def add_collaborator(
         response_data["note"] = "Personal repos only support collaborator access (read+write). Permission parameter ignored."
 
     return ToolResult(success=True, data=response_data).to_response()
+
+
+@mcp.tool()
+@protected
+async def cancel_invitation(owner: str, repo: str, invitation_id: int) -> List[TextContent]:
+    """
+    Cancel a pending repository invitation.
+
+    Args:
+        owner: Repository owner
+        repo: Repository name
+        invitation_id: ID of the invitation to cancel
+    """
+    if not validate_username(owner):
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid owner name"
+        ).to_response()
+
+    if not validate_repo_name(repo):
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid repository name"
+        ).to_response()
+
+    result = await github.request(
+        "DELETE",
+        f"/repos/{owner}/{repo}/invitations/{invitation_id}"
+    )
+
+    if not result.success:
+        return result.to_response()
+
+    return ToolResult(success=True, data={
+        "action": "invitation_cancelled",
+        "repository": f"{owner}/{repo}",
+        "invitation_id": invitation_id
+    }).to_response()
 
 
 @mcp.tool()
@@ -719,8 +842,6 @@ async def remove_collaborator(owner: str, repo: str, username: str) -> List[Text
 
     if not result.success:
         return result.to_response()
-
-    github.invalidate_cache(f"{owner}/{repo}")
 
     return ToolResult(success=True, data={
         "action": "removed",
