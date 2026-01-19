@@ -404,9 +404,7 @@ def protected(func):
 @mcp.tool()
 async def who_am_i() -> List[TextContent]:
     """
-    Get information about the current GitHub token.
-
-    Returns token owner, scopes, and repository counts.
+    Get current GitHub account info (token owner, scopes, repo counts).
     """
     result = await github.get_token_info()
     if not result.success:
@@ -424,10 +422,10 @@ async def who_am_i() -> List[TextContent]:
 @mcp.tool()
 async def list_my_repos(type: str = "owner") -> List[TextContent]:
     """
-    List repositories owned by the token owner.
+    List repositories owned by current account.
 
     Args:
-        type: Filter type - "owner", "member", or "all"
+        type: Filter - "owner", "member", or "all"
     """
     token_info = await github.get_token_info()
     if not token_info.success:
@@ -465,7 +463,7 @@ async def list_repos(owner: str, type: str = "owner") -> List[TextContent]:
 
     Args:
         owner: GitHub username or organization name
-        type: Filter type - "owner", "member", or "all"
+        type: Filter - "owner", "member", or "all"
     """
     if not validate_username(owner):
         return ToolResult(
@@ -500,13 +498,11 @@ async def list_repos(owner: str, type: str = "owner") -> List[TextContent]:
 @mcp.tool()
 async def list_collaborators(owner: str, repo: str) -> List[TextContent]:
     """
-    List collaborators for a repository.
+    List collaborators for a specific repository.
 
     Args:
-        owner: Repository owner (user or organization)
+        owner: Repository owner
         repo: Repository name
-
-    Note: Requires push access to the repository.
     """
     if not validate_username(owner) or not validate_repo_name(repo):
         return ToolResult(
@@ -542,6 +538,80 @@ async def list_collaborators(owner: str, repo: str) -> List[TextContent]:
 
 
 @mcp.tool()
+async def list_all_collaborators(max_repos: int = 20) -> List[TextContent]:
+    """
+    List ALL collaborators across all repositories (for periodic review).
+
+    Args:
+        max_repos: Max repos to check (default: 20, max: 50)
+    """
+    max_repos = min(max(1, max_repos), 50)
+
+    # Get token owner info
+    token_info = await github.get_token_info()
+    if not token_info.success:
+        return token_info.to_response()
+
+    owner = token_info.data["owner"]
+
+    # Get list of repos
+    repos_result = await github.request(
+        "GET",
+        f"/users/{owner}/repos",
+        params={"type": "owner", "per_page": max_repos, "sort": "updated"}
+    )
+
+    if not repos_result.success:
+        return repos_result.to_response()
+
+    repos = repos_result.data
+    collaborator_map = {}  # username -> {repos: [], permissions: {}}
+
+    # Get collaborators for each repo
+    for repo_data in repos:
+        repo_name = repo_data["name"]
+
+        result = await github.request(
+            "GET",
+            f"/repos/{owner}/{repo_name}/collaborators",
+            params={"per_page": 100}
+        )
+
+        if result.success and result.data:
+            for collab in result.data:
+                username = collab["login"]
+                if username == owner:  # Skip owner
+                    continue
+
+                if username not in collaborator_map:
+                    collaborator_map[username] = {
+                        "username": username,
+                        "repos": [],
+                        "total_repos": 0
+                    }
+
+                collaborator_map[username]["repos"].append({
+                    "repo": repo_name,
+                    "permissions": collab.get("permissions", {})
+                })
+                collaborator_map[username]["total_repos"] += 1
+
+    # Convert to list and sort by number of repos
+    collaborators = sorted(
+        collaborator_map.values(),
+        key=lambda x: x["total_repos"],
+        reverse=True
+    )
+
+    return ToolResult(success=True, data={
+        "owner": owner,
+        "repos_checked": len(repos),
+        "total_collaborators": len(collaborators),
+        "collaborators": collaborators
+    }).to_response()
+
+
+@mcp.tool()
 @protected
 async def add_collaborator(
     owner: str,
@@ -550,21 +620,13 @@ async def add_collaborator(
     permission: str = "push"
 ) -> List[TextContent]:
     """
-    Add a collaborator to a repository.
+    Add a collaborator to repository (sends invitation).
 
     Args:
         owner: Repository owner
         repo: Repository name
         username: GitHub username to add
-        permission: Permission level (for organizations only)
-            - "pull": Read-only access
-            - "triage": Read + manage issues/PRs
-            - "push": Read + write access
-            - "maintain": Push + manage repo settings
-            - "admin": Full access
-
-    Note: Personal account repositories only support collaborator access (read+write).
-          The permission parameter is only effective for organization repositories.
+        permission: Permission level (pull/triage/push/maintain/admin) - org only
     """
     if not validate_username(owner) or not validate_username(username):
         return ToolResult(
@@ -629,7 +691,7 @@ async def add_collaborator(
 @protected
 async def remove_collaborator(owner: str, repo: str, username: str) -> List[TextContent]:
     """
-    Remove a collaborator from a repository.
+    Remove a collaborator from repository.
 
     Args:
         owner: Repository owner
@@ -670,7 +732,7 @@ async def remove_collaborator(owner: str, repo: str, username: str) -> List[Text
 @mcp.tool()
 async def security_status() -> List[TextContent]:
     """
-    Display current security configuration.
+    View current security configuration (whitelist, rate limit, audit log).
     """
     token_info = await github.get_token_info()
     token_owner = token_info.data.get("owner", "unknown") if token_info.success else "unknown"
@@ -698,31 +760,11 @@ async def get_user_info(
     check_org: str = None
 ) -> List[TextContent]:
     """
-    Get detailed information about a GitHub user.
-
-    Use this tool to:
-    - Verify if a GitHub username exists and is valid
-    - Check if a user belongs to a specific organization (e.g., "osp")
-    - Get user's profile information (name, email, company, location)
-    - View user's public activity stats (repos, followers, following)
-    - Identify when the account was created
+    Get user info and verify organization membership.
 
     Args:
         username: GitHub username to lookup
-        check_org: Optional organization name to verify membership
-                   (e.g., "osp" to check if user is member of osp org)
-
-    Returns:
-        - login: GitHub username
-        - name: Display name
-        - email: Public email (if available)
-        - company: Company/organization from profile
-        - location: Location from profile
-        - bio: User bio
-        - public_repos: Number of public repositories
-        - followers/following: Social stats
-        - created_at: Account creation date
-        - is_org_member: Whether user belongs to check_org (if specified)
+        check_org: Organization name to check membership (optional)
     """
     if not validate_username(username):
         return ToolResult(
@@ -804,24 +846,15 @@ async def review_user_repo_activity(
     per_page: int = 30
 ) -> List[TextContent]:
     """
-    Rà soát hoạt động của một user trên một repository cụ thể.
-
-    Dùng tool này để:
-    - Kiểm tra user có đóng góp commits trên repo không
-    - Rà soát định kỳ hoạt động của collaborator
-    - Xem chi tiết commits của user trên repo
+    Review user activity on a specific repository.
 
     Args:
-        owner: Chủ sở hữu repository
-        repo: Tên repository
-        username: GitHub username hoặc email của user cần kiểm tra
-        since: Chỉ lấy commits sau ngày này (ISO 8601, vd: "2024-01-01")
-        until: Chỉ lấy commits trước ngày này (ISO 8601, vd: "2024-12-31")
-        per_page: Số commits trả về (mặc định: 30, tối đa: 100)
-
-    Returns:
-        - total: Tổng số commits
-        - commits: Danh sách commits (sha, message, date, url)
+        owner: Repository owner
+        repo: Repository name
+        username: GitHub username to check
+        since: Filter commits after this date (ISO 8601)
+        until: Filter commits before this date (ISO 8601)
+        per_page: Number of commits to return (default: 30, max: 100)
     """
     if not validate_username(owner):
         return ToolResult(
@@ -890,23 +923,13 @@ async def review_user_activity(
     max_repos: int = 20
 ) -> List[TextContent]:
     """
-    Rà soát toàn bộ hoạt động của một user trên TẤT CẢ repositories.
-
-    Dùng tool này để:
-    - Rà soát định kỳ hoạt động của user/collaborator
-    - Kiểm tra user đã đóng góp gì trước khi thêm làm collaborator
-    - Xem tổng quan hoạt động của user trên tất cả repos
+    Review user activity across ALL repositories (for periodic review).
 
     Args:
-        username: GitHub username hoặc email của user cần kiểm tra
-        since: Chỉ lấy commits sau ngày này (ISO 8601, vd: "2024-01-01")
-        until: Chỉ lấy commits trước ngày này (ISO 8601, vd: "2024-12-31")
-        max_repos: Số repos tối đa để kiểm tra (mặc định: 20, tối đa: 50)
-
-    Returns:
-        - total_commits: Tổng số commits tìm thấy
-        - repos_with_commits: Danh sách repos có commits
-        - commits_by_repo: Chi tiết commits theo từng repo
+        username: GitHub username to check
+        since: Filter commits after this date (ISO 8601)
+        until: Filter commits before this date (ISO 8601)
+        max_repos: Max repos to check (default: 20, max: 50)
     """
     if not username or len(username) > 100:
         return ToolResult(
@@ -985,10 +1008,10 @@ async def review_user_activity(
 @mcp.tool()
 async def audit_log_recent(limit: int = 20) -> List[TextContent]:
     """
-    Retrieve recent audit log entries.
+    View recent audit log entries (operations history).
 
     Args:
-        limit: Maximum number of entries to return (default: 20)
+        limit: Max entries to return (default: 20)
     """
     try:
         with open(config.audit_log_path, "r") as f:
