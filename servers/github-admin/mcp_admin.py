@@ -51,7 +51,7 @@ class SecurityConfig:
         [p.strip() for p in os.environ.get("MCP_ALLOWED_REPOS", "*/*").split(",") if p.strip()]
     )
     max_requests_per_minute: int = int(os.environ.get("MCP_RATE_LIMIT", "30"))
-    audit_log_path: str = os.environ.get("MCP_AUDIT_LOG", "./mcp_audit.log")
+    audit_log_path: str = os.environ.get("MCP_AUDIT_LOG", "./logs/mcp_audit.log")
 
 
 config = SecurityConfig()

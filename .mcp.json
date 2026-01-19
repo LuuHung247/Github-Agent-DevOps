@@ -6,7 +6,7 @@
                 "--directory",
                 "/home/hunglk/Documents/VSCode/osp/user-repo-agent",
                 "run",
-                "mcp_admin.py"
+                "servers/github-admin/mcp_admin.py"
             ]
         }
     }
