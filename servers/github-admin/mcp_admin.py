@@ -693,6 +693,296 @@ async def security_status() -> List[TextContent]:
 
 
 @mcp.tool()
+async def get_user_info(
+    username: str,
+    check_org: str = None
+) -> List[TextContent]:
+    """
+    Get detailed information about a GitHub user.
+
+    Use this tool to:
+    - Verify if a GitHub username exists and is valid
+    - Check if a user belongs to a specific organization (e.g., "osp")
+    - Get user's profile information (name, email, company, location)
+    - View user's public activity stats (repos, followers, following)
+    - Identify when the account was created
+
+    Args:
+        username: GitHub username to lookup
+        check_org: Optional organization name to verify membership
+                   (e.g., "osp" to check if user is member of osp org)
+
+    Returns:
+        - login: GitHub username
+        - name: Display name
+        - email: Public email (if available)
+        - company: Company/organization from profile
+        - location: Location from profile
+        - bio: User bio
+        - public_repos: Number of public repositories
+        - followers/following: Social stats
+        - created_at: Account creation date
+        - is_org_member: Whether user belongs to check_org (if specified)
+    """
+    if not validate_username(username):
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid username format"
+        ).to_response()
+
+    # Get user info
+    result = await github.request("GET", f"/users/{username}")
+
+    if not result.success:
+        return result.to_response()
+
+    user_data = result.data
+    response = {
+        "login": user_data.get("login"),
+        "name": user_data.get("name"),
+        "email": user_data.get("email"),
+        "company": user_data.get("company"),
+        "location": user_data.get("location"),
+        "bio": user_data.get("bio"),
+        "public_repos": user_data.get("public_repos"),
+        "followers": user_data.get("followers"),
+        "following": user_data.get("following"),
+        "created_at": user_data.get("created_at"),
+        "profile_url": user_data.get("html_url"),
+        "type": user_data.get("type")  # "User" or "Organization"
+    }
+
+    # Check organization membership if requested
+    if check_org:
+        if not validate_username(check_org):
+            return ToolResult(
+                success=False,
+                error_code=ErrorCode.VALIDATION_ERROR.value,
+                error_message="Invalid organization name"
+            ).to_response()
+
+        # Try to check org membership
+        # Note: This only works if you have permission to view org members
+        # or if the membership is public
+        org_check = await github.request(
+            "GET",
+            f"/orgs/{check_org}/members/{username}"
+        )
+
+        if org_check.success:
+            response["is_org_member"] = True
+            response["org_checked"] = check_org
+        elif org_check.error_code == ErrorCode.NOT_FOUND.value:
+            # Could be: not a member, or membership is private
+            # Try checking public membership
+            public_check = await github.request(
+                "GET",
+                f"/orgs/{check_org}/public_members/{username}"
+            )
+            if public_check.success:
+                response["is_org_member"] = True
+                response["membership_visibility"] = "public"
+            else:
+                response["is_org_member"] = False
+            response["org_checked"] = check_org
+        else:
+            response["is_org_member"] = "unknown"
+            response["org_check_error"] = org_check.error_message
+            response["org_checked"] = check_org
+
+    return ToolResult(success=True, data=response).to_response()
+
+
+@mcp.tool()
+async def review_user_repo_activity(
+    owner: str,
+    repo: str,
+    username: str,
+    since: str = None,
+    until: str = None,
+    per_page: int = 30
+) -> List[TextContent]:
+    """
+    Rà soát hoạt động của một user trên một repository cụ thể.
+
+    Dùng tool này để:
+    - Kiểm tra user có đóng góp commits trên repo không
+    - Rà soát định kỳ hoạt động của collaborator
+    - Xem chi tiết commits của user trên repo
+
+    Args:
+        owner: Chủ sở hữu repository
+        repo: Tên repository
+        username: GitHub username hoặc email của user cần kiểm tra
+        since: Chỉ lấy commits sau ngày này (ISO 8601, vd: "2024-01-01")
+        until: Chỉ lấy commits trước ngày này (ISO 8601, vd: "2024-12-31")
+        per_page: Số commits trả về (mặc định: 30, tối đa: 100)
+
+    Returns:
+        - total: Tổng số commits
+        - commits: Danh sách commits (sha, message, date, url)
+    """
+    if not validate_username(owner):
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid owner name"
+        ).to_response()
+
+    if not validate_repo_name(repo):
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid repository name"
+        ).to_response()
+
+    if not username or len(username) > 100:
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid username"
+        ).to_response()
+
+    per_page = min(max(1, per_page), 100)
+
+    params = {
+        "author": username,
+        "per_page": per_page
+    }
+
+    if since:
+        params["since"] = since
+    if until:
+        params["until"] = until
+
+    result = await github.request(
+        "GET",
+        f"/repos/{owner}/{repo}/commits",
+        params=params
+    )
+
+    if not result.success:
+        return result.to_response()
+
+    commits = [{
+        "sha": c["sha"][:7],
+        "message": c["commit"]["message"].split("\n")[0],
+        "author_name": c["commit"]["author"]["name"],
+        "author_email": c["commit"]["author"]["email"],
+        "date": c["commit"]["author"]["date"],
+        "url": c["html_url"]
+    } for c in result.data]
+
+    return ToolResult(success=True, data={
+        "repository": f"{owner}/{repo}",
+        "username": username,
+        "total": len(commits),
+        "commits": commits
+    }).to_response()
+
+
+@mcp.tool()
+async def review_user_activity(
+    username: str,
+    since: str = None,
+    until: str = None,
+    max_repos: int = 20
+) -> List[TextContent]:
+    """
+    Rà soát toàn bộ hoạt động của một user trên TẤT CẢ repositories.
+
+    Dùng tool này để:
+    - Rà soát định kỳ hoạt động của user/collaborator
+    - Kiểm tra user đã đóng góp gì trước khi thêm làm collaborator
+    - Xem tổng quan hoạt động của user trên tất cả repos
+
+    Args:
+        username: GitHub username hoặc email của user cần kiểm tra
+        since: Chỉ lấy commits sau ngày này (ISO 8601, vd: "2024-01-01")
+        until: Chỉ lấy commits trước ngày này (ISO 8601, vd: "2024-12-31")
+        max_repos: Số repos tối đa để kiểm tra (mặc định: 20, tối đa: 50)
+
+    Returns:
+        - total_commits: Tổng số commits tìm thấy
+        - repos_with_commits: Danh sách repos có commits
+        - commits_by_repo: Chi tiết commits theo từng repo
+    """
+    if not username or len(username) > 100:
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid username"
+        ).to_response()
+
+    max_repos = min(max(1, max_repos), 50)
+
+    # Get token owner info
+    token_info = await github.get_token_info()
+    if not token_info.success:
+        return token_info.to_response()
+
+    owner = token_info.data["owner"]
+
+    # Get list of repos
+    repos_result = await github.request(
+        "GET",
+        f"/users/{owner}/repos",
+        params={"type": "owner", "per_page": max_repos, "sort": "updated"}
+    )
+
+    if not repos_result.success:
+        return repos_result.to_response()
+
+    repos = repos_result.data
+    commits_by_repo = []
+    total_commits = 0
+    repos_with_commits = []
+
+    # Search commits in each repo
+    for repo_data in repos:
+        repo_name = repo_data["name"]
+
+        params = {"author": username, "per_page": 10}
+        if since:
+            params["since"] = since
+        if until:
+            params["until"] = until
+
+        result = await github.request(
+            "GET",
+            f"/repos/{owner}/{repo_name}/commits",
+            params=params
+        )
+
+        if result.success and result.data:
+            commits = [{
+                "sha": c["sha"][:7],
+                "message": c["commit"]["message"].split("\n")[0],
+                "date": c["commit"]["author"]["date"],
+                "url": c["html_url"]
+            } for c in result.data]
+
+            if commits:
+                repos_with_commits.append(repo_name)
+                total_commits += len(commits)
+                commits_by_repo.append({
+                    "repository": f"{owner}/{repo_name}",
+                    "commit_count": len(commits),
+                    "commits": commits
+                })
+
+    return ToolResult(success=True, data={
+        "username": username,
+        "owner": owner,
+        "total_commits": total_commits,
+        "repos_checked": len(repos),
+        "repos_with_commits": repos_with_commits,
+        "commits_by_repo": commits_by_repo
+    }).to_response()
+
+
+@mcp.tool()
 async def audit_log_recent(limit: int = 20) -> List[TextContent]:
     """
     Retrieve recent audit log entries.
