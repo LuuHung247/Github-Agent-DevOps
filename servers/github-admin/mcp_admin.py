@@ -1154,7 +1154,6 @@ async def audit_log_recent(limit: int = 20) -> List[TextContent]:
         return ToolResult(success=True, data={
             "total": 0,
             "logs": [],
-            "note": "No audit log entries yet"
         }).to_response()
 
 
