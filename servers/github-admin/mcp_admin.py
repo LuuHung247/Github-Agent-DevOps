@@ -1308,6 +1308,603 @@ async def create_repo_from_template(
 
 
 # =============================================================================
+# GitHub Actions Secrets Management Tools
+# =============================================================================
+
+@mcp.tool()
+async def list_action_secrets(repo: str) -> List[TextContent]:
+    """
+    List all GitHub Actions secrets for a repository.
+
+    Args:
+        repo: Repository name
+    """
+    # Get token owner
+    token_info = await github.get_token_info()
+    if not token_info.success:
+        return token_info.to_response()
+    owner = token_info.data["owner"]
+
+    if not validate_repo_name(repo):
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid repository name"
+        ).to_response()
+
+    result = await github.request(
+        "GET",
+        f"/repos/{owner}/{repo}/actions/secrets"
+    )
+
+    if not result.success:
+        return result.to_response()
+
+    secrets = result.data.get("secrets", [])
+    return ToolResult(success=True, data={
+        "repository": f"{owner}/{repo}",
+        "total_secrets": len(secrets),
+        "secrets": [{
+            "name": s.get("name"),
+            "created_at": s.get("created_at"),
+            "updated_at": s.get("updated_at")
+        } for s in secrets]
+    }).to_response()
+
+
+@mcp.tool()
+@protected
+async def create_action_secret(
+    repo: str,
+    secret_name: str,
+    secret_value: str
+) -> List[TextContent]:
+    """
+    Create or update a GitHub Actions secret for a repository.
+    Note: The secret value will be encrypted by GitHub.
+
+    Args:
+        repo: Repository name
+        secret_name: Name of the secret
+        secret_value: Value of the secret (will be encrypted)
+    """
+    # Get token owner
+    token_info = await github.get_token_info()
+    if not token_info.success:
+        return token_info.to_response()
+    owner = token_info.data["owner"]
+
+    if not validate_repo_name(repo):
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid repository name"
+        ).to_response()
+
+    if not secret_name or not re.match(r'^[a-zA-Z_][a-zA-Z0-9_-]*$', secret_name):
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid secret name. Must start with letter or underscore, contain only letters, digits, underscores, hyphens"
+        ).to_response()
+
+    # Import for encryption
+    try:
+        from nacl import encoding, pwhash
+        from nacl.secret import SecretBox
+    except ImportError:
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.API_ERROR.value,
+            error_message="PyNaCl library required for secret encryption. Install: pip install pynacl"
+        ).to_response()
+
+    # Get the public key for the repo
+    pubkey_result = await github.request(
+        "GET",
+        f"/repos/{owner}/{repo}/actions/secrets/public-key"
+    )
+
+    if not pubkey_result.success:
+        return pubkey_result.to_response()
+
+    public_key = pubkey_result.data.get("key")
+    key_id = pubkey_result.data.get("key_id")
+
+    if not public_key or not key_id:
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.API_ERROR.value,
+            error_message="Failed to get repository public key"
+        ).to_response()
+
+    # Encrypt the secret value
+    try:
+        from nacl.encoding import Base64Encoder
+        from nacl.public import SealedBox, PublicKey
+
+        public_key_obj = PublicKey(public_key.encode('utf-8'), Base64Encoder)
+        sealed_box = SealedBox(public_key_obj)
+        encrypted = sealed_box.encrypt(secret_value.encode('utf-8'), Base64Encoder)
+        encrypted_value = encrypted.decode('utf-8')
+    except Exception as e:
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.API_ERROR.value,
+            error_message=f"Encryption failed: {str(e)}"
+        ).to_response()
+
+    # Create or update the secret
+    result = await github.request(
+        "PUT",
+        f"/repos/{owner}/{repo}/actions/secrets/{secret_name}",
+        json_data={
+            "encrypted_value": encrypted_value,
+            "key_id": key_id
+        }
+    )
+
+    if not result.success:
+        return result.to_response()
+
+    return ToolResult(success=True, data={
+        "action": "secret_created_updated",
+        "repository": f"{owner}/{repo}",
+        "secret_name": secret_name
+    }).to_response()
+
+
+@mcp.tool()
+@protected
+async def delete_action_secret(
+    repo: str,
+    secret_name: str
+) -> List[TextContent]:
+    """
+    Delete a GitHub Actions secret from a repository.
+
+    Args:
+        repo: Repository name
+        secret_name: Name of the secret to delete
+    """
+    # Get token owner
+    token_info = await github.get_token_info()
+    if not token_info.success:
+        return token_info.to_response()
+    owner = token_info.data["owner"]
+
+    if not validate_repo_name(repo):
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid repository name"
+        ).to_response()
+
+    if not secret_name:
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Secret name is required"
+        ).to_response()
+
+    result = await github.request(
+        "DELETE",
+        f"/repos/{owner}/{repo}/actions/secrets/{secret_name}"
+    )
+
+    if not result.success:
+        return result.to_response()
+
+    return ToolResult(success=True, data={
+        "action": "secret_deleted",
+        "repository": f"{owner}/{repo}",
+        "secret_name": secret_name
+    }).to_response()
+
+
+@mcp.tool()
+async def list_environments(repo: str) -> List[TextContent]:
+    """
+    List all environments in a repository.
+
+    Args:
+        repo: Repository name
+    """
+    # Get token owner
+    token_info = await github.get_token_info()
+    if not token_info.success:
+        return token_info.to_response()
+    owner = token_info.data["owner"]
+
+    if not validate_repo_name(repo):
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid repository name"
+        ).to_response()
+
+    result = await github.request(
+        "GET",
+        f"/repos/{owner}/{repo}/environments"
+    )
+
+    if not result.success:
+        return result.to_response()
+
+    environments = result.data.get("environments", [])
+    return ToolResult(success=True, data={
+        "repository": f"{owner}/{repo}",
+        "total_environments": len(environments),
+        "environments": [{
+            "name": env.get("name"),
+            "created_at": env.get("created_at"),
+            "updated_at": env.get("updated_at"),
+            "protection_rules": env.get("protection_rules", []),
+            "deployment_branch_policy": env.get("deployment_branch_policy")
+        } for env in environments]
+    }).to_response()
+
+
+@mcp.tool()
+@protected
+async def create_environment(
+    repo: str,
+    environment: str,
+    wait_timer: int = None,
+    reviewers: str = None,
+    deployment_branch_policy: str = None
+) -> List[TextContent]:
+    """
+    Create or update an environment in a repository.
+
+    Args:
+        repo: Repository name
+        environment: Environment name (e.g., 'production', 'staging')
+        wait_timer: Optional. Wait timer in seconds (0-43200)
+        reviewers: Optional. Comma-separated list of reviewer usernames
+        deployment_branch_policy: Optional. Branch policy: 'none', 'all', or 'protected_branches'
+    """
+    # Get token owner
+    token_info = await github.get_token_info()
+    if not token_info.success:
+        return token_info.to_response()
+    owner = token_info.data["owner"]
+
+    if not validate_repo_name(repo):
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid repository name"
+        ).to_response()
+
+    if not environment or not re.match(r'^[a-zA-Z_][a-zA-Z0-9_-]*$', environment):
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid environment name. Must start with letter or underscore, contain only letters, digits, underscores, hyphens"
+        ).to_response()
+
+    # Build request payload
+    payload = {}
+    if wait_timer is not None:
+        if not isinstance(wait_timer, int) or wait_timer < 0 or wait_timer > 43200:
+            return ToolResult(
+                success=False,
+                error_code=ErrorCode.VALIDATION_ERROR.value,
+                error_message="Wait timer must be between 0 and 43200 seconds"
+            ).to_response()
+        payload["wait_timer"] = wait_timer
+
+    if reviewers:
+        reviewer_list = [r.strip() for r in reviewers.split(",") if r.strip()]
+        if reviewer_list:
+            # Get user IDs for reviewers
+            reviewers_data = []
+            for r in reviewer_list:
+                user_result = await github.request("GET", f"/users/{r}")
+                if user_result.success:
+                    reviewers_data.append({"type": "User", "id": user_result.data.get("id")})
+            if reviewers_data:
+                payload["reviewers"] = reviewers_data
+
+    if deployment_branch_policy:
+        if deployment_branch_policy not in ["none", "all", "protected_branches"]:
+            return ToolResult(
+                success=False,
+                error_code=ErrorCode.VALIDATION_ERROR.value,
+                error_message="Deployment branch policy must be: 'none', 'all', or 'protected_branches'"
+            ).to_response()
+        if deployment_branch_policy == "none":
+            payload["deployment_branch_policy"] = None
+        elif deployment_branch_policy == "all":
+            payload["deployment_branch_policy"] = {"protected_branches": False, "custom_branch_policies": False}
+        else:  # protected_branches
+            payload["deployment_branch_policy"] = {"protected_branches": True, "custom_branch_policies": False}
+
+    result = await github.request(
+        "PUT",
+        f"/repos/{owner}/{repo}/environments/{environment}",
+        json_data=payload if payload else None
+    )
+
+    if not result.success:
+        return result.to_response()
+
+    return ToolResult(success=True, data={
+        "action": "environment_created_updated",
+        "repository": f"{owner}/{repo}",
+        "environment": environment,
+        "wait_timer": wait_timer,
+        "deployment_branch_policy": deployment_branch_policy
+    }).to_response()
+
+
+@mcp.tool()
+@protected
+async def delete_environment(
+    repo: str,
+    environment: str
+) -> List[TextContent]:
+    """
+    Delete an environment from a repository.
+
+    Args:
+        repo: Repository name
+        environment: Environment name (e.g., 'production', 'staging')
+    """
+    # Get token owner
+    token_info = await github.get_token_info()
+    if not token_info.success:
+        return token_info.to_response()
+    owner = token_info.data["owner"]
+
+    if not validate_repo_name(repo):
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid repository name"
+        ).to_response()
+
+    if not environment:
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Environment name is required"
+        ).to_response()
+
+    result = await github.request(
+        "DELETE",
+        f"/repos/{owner}/{repo}/environments/{environment}"
+    )
+
+    if not result.success:
+        return result.to_response()
+
+    return ToolResult(success=True, data={
+        "action": "environment_deleted",
+        "repository": f"{owner}/{repo}",
+        "environment": environment
+    }).to_response()
+
+
+@mcp.tool()
+async def list_environment_secrets(repo: str, environment: str) -> List[TextContent]:
+    """
+    List all secrets for a specific environment in a repository.
+
+    Args:
+        repo: Repository name
+        environment: Environment name (e.g., 'production', 'staging')
+    """
+    # Get token owner
+    token_info = await github.get_token_info()
+    if not token_info.success:
+        return token_info.to_response()
+    owner = token_info.data["owner"]
+
+    if not validate_repo_name(repo):
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid repository name"
+        ).to_response()
+
+    if not environment:
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Environment name is required"
+        ).to_response()
+
+    result = await github.request(
+        "GET",
+        f"/repos/{owner}/{repo}/environments/{environment}/secrets"
+    )
+
+    if not result.success:
+        return result.to_response()
+
+    secrets = result.data.get("secrets", [])
+    return ToolResult(success=True, data={
+        "repository": f"{owner}/{repo}",
+        "environment": environment,
+        "total_secrets": len(secrets),
+        "secrets": [{
+            "name": s.get("name"),
+            "created_at": s.get("created_at"),
+            "updated_at": s.get("updated_at")
+        } for s in secrets]
+    }).to_response()
+
+
+@mcp.tool()
+@protected
+async def create_environment_secret(
+    repo: str,
+    environment: str,
+    secret_name: str,
+    secret_value: str
+) -> List[TextContent]:
+    """
+    Create or update a secret for a specific environment in a repository.
+    Note: The secret value will be encrypted by GitHub.
+
+    Args:
+        repo: Repository name
+        environment: Environment name (e.g., 'production', 'staging')
+        secret_name: Name of the secret
+        secret_value: Value of the secret (will be encrypted)
+    """
+    # Get token owner
+    token_info = await github.get_token_info()
+    if not token_info.success:
+        return token_info.to_response()
+    owner = token_info.data["owner"]
+
+    if not validate_repo_name(repo):
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid repository name"
+        ).to_response()
+
+    if not environment:
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Environment name is required"
+        ).to_response()
+
+    if not secret_name or not re.match(r'^[a-zA-Z_][a-zA-Z0-9_-]*$', secret_name):
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid secret name. Must start with letter or underscore, contain only letters, digits, underscores, hyphens"
+        ).to_response()
+
+    # Import for encryption
+    try:
+        from nacl.encoding import Base64Encoder
+        from nacl.public import SealedBox, PublicKey
+    except ImportError:
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.API_ERROR.value,
+            error_message="PyNaCl library required for secret encryption. Install: pip install pynacl"
+        ).to_response()
+
+    # Get the public key for the environment
+    pubkey_result = await github.request(
+        "GET",
+        f"/repos/{owner}/{repo}/environments/{environment}/secrets/public-key"
+    )
+
+    if not pubkey_result.success:
+        return pubkey_result.to_response()
+
+    public_key = pubkey_result.data.get("key")
+    key_id = pubkey_result.data.get("key_id")
+
+    if not public_key or not key_id:
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.API_ERROR.value,
+            error_message="Failed to get environment public key"
+        ).to_response()
+
+    # Encrypt the secret value
+    try:
+        public_key_obj = PublicKey(public_key.encode('utf-8'), Base64Encoder)
+        sealed_box = SealedBox(public_key_obj)
+        encrypted = sealed_box.encrypt(secret_value.encode('utf-8'), Base64Encoder)
+        encrypted_value = encrypted.decode('utf-8')
+    except Exception as e:
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.API_ERROR.value,
+            error_message=f"Encryption failed: {str(e)}"
+        ).to_response()
+
+    # Create or update the secret
+    result = await github.request(
+        "PUT",
+        f"/repos/{owner}/{repo}/environments/{environment}/secrets/{secret_name}",
+        json_data={
+            "encrypted_value": encrypted_value,
+            "key_id": key_id
+        }
+    )
+
+    if not result.success:
+        return result.to_response()
+
+    return ToolResult(success=True, data={
+        "action": "environment_secret_created_updated",
+        "repository": f"{owner}/{repo}",
+        "environment": environment,
+        "secret_name": secret_name
+    }).to_response()
+
+
+@mcp.tool()
+@protected
+async def delete_environment_secret(
+    repo: str,
+    environment: str,
+    secret_name: str
+) -> List[TextContent]:
+    """
+    Delete a secret from a specific environment in a repository.
+
+    Args:
+        repo: Repository name
+        environment: Environment name (e.g., 'production', 'staging')
+        secret_name: Name of the secret to delete
+    """
+    # Get token owner
+    token_info = await github.get_token_info()
+    if not token_info.success:
+        return token_info.to_response()
+    owner = token_info.data["owner"]
+
+    if not validate_repo_name(repo):
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid repository name"
+        ).to_response()
+
+    if not environment:
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Environment name is required"
+        ).to_response()
+
+    if not secret_name:
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Secret name is required"
+        ).to_response()
+
+    result = await github.request(
+        "DELETE",
+        f"/repos/{owner}/{repo}/environments/{environment}/secrets/{secret_name}"
+    )
+
+    if not result.success:
+        return result.to_response()
+
+    return ToolResult(success=True, data={
+        "action": "environment_secret_deleted",
+        "repository": f"{owner}/{repo}",
+        "environment": environment,
+        "secret_name": secret_name
+    }).to_response()
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
