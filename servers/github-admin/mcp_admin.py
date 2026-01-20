@@ -40,15 +40,10 @@ class SecurityConfig:
 
     Security layers:
     - Input validation: Prevents injection attacks
-    - Repo whitelist: Restricts operations to specific repositories
     - Rate limiting: Prevents abuse
     - Audit logging: Records all operations
     - GitHub token scope: Enforced by GitHub API
     """
-
-    allowed_repo_patterns: List[str] = field(default_factory=lambda:
-        [p.strip() for p in os.environ.get("MCP_ALLOWED_REPOS", "*/*").split(",") if p.strip()]
-    )
     max_requests_per_minute: int = int(os.environ.get("MCP_RATE_LIMIT", "30"))
     audit_log_path: str = os.environ.get("MCP_AUDIT_LOG", "./logs/mcp_audit.log")
 
@@ -293,17 +288,6 @@ def validate_username(username: str) -> bool:
     return bool(re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$', username))
 
 
-def check_repo_allowed(owner: str, repo: str) -> bool:
-    """Check if repository is in whitelist."""
-    full_name = f"{owner}/{repo}"
-    for pattern in config.allowed_repo_patterns:
-        if pattern == "*/*":
-            return True
-        pattern_regex = pattern.replace("*", ".*")
-        if re.match(f"^{pattern_regex}$", full_name):
-            return True
-    return False
-
 
 # =============================================================================
 # Rate Limiting
@@ -363,19 +347,6 @@ def protected(func):
                 error_message=f"Rate limit exceeded: {config.max_requests_per_minute} requests/minute"
             ).to_response()
 
-        # Repo whitelist check
-        if "owner" in kwargs and "repo" in kwargs:
-            if not check_repo_allowed(kwargs["owner"], kwargs["repo"]):
-                audit_log(func.__name__, {
-                    "reason": "repo_not_allowed",
-                    "repo": f"{kwargs['owner']}/{kwargs['repo']}"
-                }, caller, False)
-                return ToolResult(
-                    success=False,
-                    error_code=ErrorCode.PERMISSION_DENIED.value,
-                    error_message=f"Repository not in whitelist: {kwargs['owner']}/{kwargs['repo']}"
-                ).to_response()
-
         result = await func(*args, **kwargs)
 
         audit_log(
@@ -393,24 +364,6 @@ def protected(func):
 # =============================================================================
 # MCP Tools
 # =============================================================================
-
-@mcp.tool()
-async def who_am_i() -> List[TextContent]:
-    """
-    Get current GitHub account info (token owner, scopes, repo counts).
-    """
-    result = await github.get_token_info()
-    if not result.success:
-        return result.to_response()
-
-    return ToolResult(success=True, data={
-        "token_owner": result.data["owner"],
-        "name": result.data.get("name", ""),
-        "scopes": result.data.get("scopes", []),
-        "public_repos": result.data.get("public_repos", 0),
-        "private_repos": result.data.get("private_repos", 0)
-    }).to_response()
-
 
 @mcp.tool()
 async def quick_overview(max_repos: int = 10) -> List[TextContent]:
@@ -492,18 +445,27 @@ async def quick_overview(max_repos: int = 10) -> List[TextContent]:
 
 
 @mcp.tool()
-async def list_my_repos(type: str = "owner") -> List[TextContent]:
+async def list_repos(owner: str = None, type: str = "owner") -> List[TextContent]:
     """
-    List repositories owned by current account.
+    List repositories for a user or organization.
 
     Args:
+        owner: GitHub username or organization name (optional, defaults to token owner)
         type: Filter - "owner", "member", or "all"
     """
-    token_info = await github.get_token_info()
-    if not token_info.success:
-        return token_info.to_response()
+    # Use token owner if not specified
+    if not owner:
+        token_info = await github.get_token_info()
+        if not token_info.success:
+            return token_info.to_response()
+        owner = token_info.data["owner"]
+    elif not validate_username(owner):
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid username format"
+        ).to_response()
 
-    owner = token_info.data["owner"]
     result = await github.request(
         "GET",
         f"/users/{owner}/repos",
@@ -529,118 +491,14 @@ async def list_my_repos(type: str = "owner") -> List[TextContent]:
 
 
 @mcp.tool()
-async def list_repos(owner: str, type: str = "owner") -> List[TextContent]:
+async def list_collaborators(repo: str = None, max_repos: int = 20) -> List[TextContent]:
     """
-    List repositories for any user or organization.
+    List collaborators for a specific repository or across all repositories.
 
     Args:
-        owner: GitHub username or organization name
-        type: Filter - "owner", "member", or "all"
+        repo: Repository name (optional). If not specified, lists collaborators across all repos.
+        max_repos: Max repos to check when repo is not specified (default: 20, max: 50)
     """
-    if not validate_username(owner):
-        return ToolResult(
-            success=False,
-            error_code=ErrorCode.VALIDATION_ERROR.value,
-            error_message="Invalid username format"
-        ).to_response()
-
-    result = await github.request(
-        "GET",
-        f"/users/{owner}/repos",
-        params={"type": type, "per_page": 100}
-    )
-
-    if not result.success:
-        return result.to_response()
-
-    repos = [{
-        "full_name": r["full_name"],
-        "name": r["name"],
-        "private": r["private"],
-        "description": r.get("description", "")
-    } for r in result.data]
-
-    return ToolResult(success=True, data={
-        "owner": owner,
-        "total": len(repos),
-        "repositories": repos
-    }).to_response()
-
-
-@mcp.tool()
-async def list_collaborators(
-    owner: str,
-    repo: str,
-    fields: str = "login,permissions,role_name"
-) -> List[TextContent]:
-    """
-    List collaborators for a specific repository.
-
-    Args:
-        owner: Repository owner
-        repo: Repository name
-        fields: Comma-separated fields to return (login,permissions,role_name). Default: all fields.
-    """
-    if not validate_username(owner) or not validate_repo_name(repo):
-        return ToolResult(
-            success=False,
-            error_code=ErrorCode.VALIDATION_ERROR.value,
-            error_message="Invalid owner or repository name"
-        ).to_response()
-
-    result = await github.request(
-        "GET",
-        f"/repos/{owner}/{repo}/collaborators",
-        params={"per_page": 100}
-    )
-
-    if not result.success:
-        return result.to_response()
-
-    owner_type = await github.get_owner_type(owner)
-
-    # Parse requested fields
-    valid_fields = {"login", "permissions", "role_name"}
-    requested_fields = {f.strip() for f in fields.split(",") if f.strip() in valid_fields}
-    if not requested_fields:
-        requested_fields = valid_fields
-
-    # Build collaborator data with only requested fields
-    collaborators = []
-    for c in result.data:
-        collab = {}
-        if "login" in requested_fields:
-            collab["login"] = c["login"]
-        if "permissions" in requested_fields:
-            collab["permissions"] = c.get("permissions", {})
-        if "role_name" in requested_fields:
-            collab["role_name"] = c.get("role_name", "collaborator" if owner_type == "User" else "unknown")
-        collaborators.append(collab)
-
-    response_data = {
-        "repository": f"{owner}/{repo}",
-        "total": len(collaborators),
-        "collaborators": collaborators
-    }
-
-    # Only include owner_type and note if permissions or role_name are requested
-    if "permissions" in requested_fields or "role_name" in requested_fields:
-        response_data["owner_type"] = owner_type
-        response_data["note"] = "Personal repos have only owner/collaborator roles. Organizations support granular permissions."
-
-    return ToolResult(success=True, data=response_data).to_response()
-
-
-@mcp.tool()
-async def list_all_collaborators(max_repos: int = 20) -> List[TextContent]:
-    """
-    List ALL collaborators across all repositories (for periodic review).
-
-    Args:
-        max_repos: Max repos to check (default: 20, max: 50)
-    """
-    max_repos = min(max(1, max_repos), 50)
-
     # Get token owner info
     token_info = await github.get_token_info()
     if not token_info.success:
@@ -648,7 +506,39 @@ async def list_all_collaborators(max_repos: int = 20) -> List[TextContent]:
 
     owner = token_info.data["owner"]
 
-    # Get list of repos
+    # Single repo mode
+    if repo:
+        if not validate_repo_name(repo):
+            return ToolResult(
+                success=False,
+                error_code=ErrorCode.VALIDATION_ERROR.value,
+                error_message="Invalid repository name"
+            ).to_response()
+
+        result = await github.request(
+            "GET",
+            f"/repos/{owner}/{repo}/collaborators",
+            params={"per_page": 100}
+        )
+
+        if not result.success:
+            return result.to_response()
+
+        collaborators = [{
+            "login": c["login"],
+            "permissions": c.get("permissions", {}),
+            "role_name": c.get("role_name", "collaborator")
+        } for c in result.data if c["login"] != owner]
+
+        return ToolResult(success=True, data={
+            "repository": f"{owner}/{repo}",
+            "total": len(collaborators),
+            "collaborators": collaborators
+        }).to_response()
+
+    # All repos mode
+    max_repos = min(max(1, max_repos), 50)
+
     repos_result = await github.request(
         "GET",
         f"/users/{owner}/repos",
@@ -659,9 +549,8 @@ async def list_all_collaborators(max_repos: int = 20) -> List[TextContent]:
         return repos_result.to_response()
 
     repos = repos_result.data
-    collaborator_map = {}  # username -> {repos: [], permissions: {}}
+    collaborator_map = {}
 
-    # Get collaborators for each repo IN PARALLEL
     async def fetch_collaborators(repo_name: str) -> tuple:
         result = await github.request(
             "GET",
@@ -680,7 +569,7 @@ async def list_all_collaborators(max_repos: int = 20) -> List[TextContent]:
         if result.success and result.data:
             for collab in result.data:
                 username = collab["login"]
-                if username == owner:  # Skip owner
+                if username == owner:
                     continue
 
                 if username not in collaborator_map:
@@ -696,7 +585,6 @@ async def list_all_collaborators(max_repos: int = 20) -> List[TextContent]:
                 })
                 collaborator_map[username]["total_repos"] += 1
 
-    # Convert to list and sort by number of repos
     collaborators = sorted(
         collaborator_map.values(),
         key=lambda x: x["total_repos"],
@@ -712,56 +600,14 @@ async def list_all_collaborators(max_repos: int = 20) -> List[TextContent]:
 
 
 @mcp.tool()
-async def list_pending_invitations(owner: str, repo: str) -> List[TextContent]:
+async def list_pending_invitations(repo: str = None, max_repos: int = 20) -> List[TextContent]:
     """
-    List pending invitations for a specific repository.
+    List pending invitations for a specific repository or across all repositories.
 
     Args:
-        owner: Repository owner
-        repo: Repository name
+        repo: Repository name (optional). If not specified, lists invitations across all repos.
+        max_repos: Max repos to check when repo is not specified (default: 20, max: 50)
     """
-    if not validate_username(owner) or not validate_repo_name(repo):
-        return ToolResult(
-            success=False,
-            error_code=ErrorCode.VALIDATION_ERROR.value,
-            error_message="Invalid owner or repository name"
-        ).to_response()
-
-    result = await github.request(
-        "GET",
-        f"/repos/{owner}/{repo}/invitations",
-        params={"per_page": 100}
-    )
-
-    if not result.success:
-        return result.to_response()
-
-    invitations = [{
-        "id": inv["id"],
-        "invitee": inv.get("invitee", {}).get("login", "unknown"),
-        "inviter": inv.get("inviter", {}).get("login", "unknown"),
-        "permissions": inv.get("permissions", "unknown"),
-        "created_at": inv.get("created_at", ""),
-        "url": inv.get("html_url", "")
-    } for inv in result.data]
-
-    return ToolResult(success=True, data={
-        "repository": f"{owner}/{repo}",
-        "total": len(invitations),
-        "pending_invitations": invitations
-    }).to_response()
-
-
-@mcp.tool()
-async def list_all_pending_invitations(max_repos: int = 20) -> List[TextContent]:
-    """
-    List ALL pending invitations across all repositories (for periodic review).
-
-    Args:
-        max_repos: Max repos to check (default: 20, max: 50)
-    """
-    max_repos = min(max(1, max_repos), 50)
-
     # Get token owner info
     token_info = await github.get_token_info()
     if not token_info.success:
@@ -769,7 +615,42 @@ async def list_all_pending_invitations(max_repos: int = 20) -> List[TextContent]
 
     owner = token_info.data["owner"]
 
-    # Get list of repos
+    # Single repo mode
+    if repo:
+        if not validate_repo_name(repo):
+            return ToolResult(
+                success=False,
+                error_code=ErrorCode.VALIDATION_ERROR.value,
+                error_message="Invalid repository name"
+            ).to_response()
+
+        result = await github.request(
+            "GET",
+            f"/repos/{owner}/{repo}/invitations",
+            params={"per_page": 100}
+        )
+
+        if not result.success:
+            return result.to_response()
+
+        invitations = [{
+            "id": inv["id"],
+            "invitee": inv.get("invitee", {}).get("login", "unknown"),
+            "inviter": inv.get("inviter", {}).get("login", "unknown"),
+            "permissions": inv.get("permissions", "unknown"),
+            "created_at": inv.get("created_at", ""),
+            "url": inv.get("html_url", "")
+        } for inv in result.data]
+
+        return ToolResult(success=True, data={
+            "repository": f"{owner}/{repo}",
+            "total": len(invitations),
+            "pending_invitations": invitations
+        }).to_response()
+
+    # All repos mode
+    max_repos = min(max(1, max_repos), 50)
+
     repos_result = await github.request(
         "GET",
         f"/users/{owner}/repos",
@@ -784,7 +665,6 @@ async def list_all_pending_invitations(max_repos: int = 20) -> List[TextContent]
     total_invitations = 0
     repos_with_invitations = []
 
-    # Get invitations for each repo IN PARALLEL
     async def fetch_invitations(repo_name: str) -> tuple:
         result = await github.request(
             "GET",
@@ -829,95 +709,19 @@ async def list_all_pending_invitations(max_repos: int = 20) -> List[TextContent]
 
 @mcp.tool()
 @protected
-async def add_collaborator(
-    owner: str,
-    repo: str,
-    username: str,
-    permission: str = "push"
-) -> List[TextContent]:
-    """
-    Add a collaborator to repository (sends invitation).
-
-    Args:
-        owner: Repository owner
-        repo: Repository name
-        username: GitHub username to add
-        permission: Permission level (pull/triage/push/maintain/admin) - org only
-    """
-    if not validate_username(owner) or not validate_username(username):
-        return ToolResult(
-            success=False,
-            error_code=ErrorCode.VALIDATION_ERROR.value,
-            error_message="Invalid username format"
-        ).to_response()
-
-    if not validate_repo_name(repo):
-        return ToolResult(
-            success=False,
-            error_code=ErrorCode.VALIDATION_ERROR.value,
-            error_message="Invalid repository name"
-        ).to_response()
-
-    valid_permissions = {"pull", "push", "admin", "maintain", "triage"}
-    if permission.lower() not in valid_permissions:
-        return ToolResult(
-            success=False,
-            error_code=ErrorCode.VALIDATION_ERROR.value,
-            error_message=f"Invalid permission. Valid values: {', '.join(sorted(valid_permissions))}"
-        ).to_response()
-
-    owner_type = await github.get_owner_type(owner)
-
-    # For personal accounts, permission parameter is ignored by GitHub API
-    # Collaborators always get read+write access
-    if owner_type == "User":
-        result = await github.request(
-            "PUT",
-            f"/repos/{owner}/{repo}/collaborators/{username}"
-        )
-        effective_permission = "push (read+write)"
-    else:
-        result = await github.request(
-            "PUT",
-            f"/repos/{owner}/{repo}/collaborators/{username}",
-            json_data={"permission": permission.lower()}
-        )
-        effective_permission = permission.lower()
-
-    if not result.success:
-        return result.to_response()
-
-    response_data = {
-        "action": "invitation_sent",
-        "repository": f"{owner}/{repo}",
-        "username": username,
-        "owner_type": owner_type,
-        "permission": effective_permission
-    }
-
-    if owner_type == "User":
-        response_data["note"] = "Personal repos only support collaborator access (read+write). Permission parameter ignored."
-
-    return ToolResult(success=True, data=response_data).to_response()
-
-
-@mcp.tool()
-@protected
-async def cancel_invitation(owner: str, repo: str, invitation_id: int) -> List[TextContent]:
+async def cancel_invitation(repo: str, invitation_id: int) -> List[TextContent]:
     """
     Cancel a pending repository invitation.
 
     Args:
-        owner: Repository owner
         repo: Repository name
         invitation_id: ID of the invitation to cancel
     """
-    if not validate_username(owner):
-        return ToolResult(
-            success=False,
-            error_code=ErrorCode.VALIDATION_ERROR.value,
-            error_message="Invalid owner name"
-        ).to_response()
+    # Get token owner
+    token_info = await github.get_token_info()
+    if not token_info.success:
+        return token_info.to_response()
+    owner = token_info.data["owner"]
 
     if not validate_repo_name(repo):
         return ToolResult(
@@ -943,67 +747,24 @@ async def cancel_invitation(owner: str, repo: str, invitation_id: int) -> List[T
 
 @mcp.tool()
 @protected
-async def remove_collaborator(owner: str, repo: str, username: str) -> List[TextContent]:
-    """
-    Remove a collaborator from repository.
-
-    Args:
-        owner: Repository owner
-        repo: Repository name
-        username: GitHub username to remove
-    """
-    if not validate_username(owner) or not validate_username(username):
-        return ToolResult(
-            success=False,
-            error_code=ErrorCode.VALIDATION_ERROR.value,
-            error_message="Invalid username format"
-        ).to_response()
-
-    if not validate_repo_name(repo):
-        return ToolResult(
-            success=False,
-            error_code=ErrorCode.VALIDATION_ERROR.value,
-            error_message="Invalid repository name"
-        ).to_response()
-
-    result = await github.request(
-        "DELETE",
-        f"/repos/{owner}/{repo}/collaborators/{username}"
-    )
-
-    if not result.success:
-        return result.to_response()
-
-    return ToolResult(success=True, data={
-        "action": "removed",
-        "repository": f"{owner}/{repo}",
-        "username": username
-    }).to_response()
-
-
-@mcp.tool()
-@protected
-async def batch_add_collaborators(
-    owner: str,
+async def add_collaborators(
     repo: str,
     usernames: str,
     permission: str = "push"
 ) -> List[TextContent]:
     """
-    Add multiple collaborators to a repository in one call (sends invitations).
+    Add collaborators to a repository (sends invitations).
 
     Args:
-        owner: Repository owner
         repo: Repository name
-        usernames: Comma-separated GitHub usernames (e.g., "user1,user2,user3")
+        usernames: Comma-separated GitHub usernames (e.g., "user1" or "user1,user2,user3")
         permission: Permission level (pull/triage/push/maintain/admin) - org only
     """
-    if not validate_username(owner):
-        return ToolResult(
-            success=False,
-            error_code=ErrorCode.VALIDATION_ERROR.value,
-            error_message="Invalid owner name"
-        ).to_response()
+    # Get token owner
+    token_info = await github.get_token_info()
+    if not token_info.success:
+        return token_info.to_response()
+    owner = token_info.data["owner"]
 
     if not validate_repo_name(repo):
         return ToolResult(
@@ -1069,7 +830,7 @@ async def batch_add_collaborators(
             failed.append({"username": item["username"], "error": item["error"]})
 
     return ToolResult(success=True, data={
-        "action": "batch_invitation_sent",
+        "action": "invitation_sent",
         "repository": f"{owner}/{repo}",
         "owner_type": owner_type,
         "permission": permission.lower() if owner_type != "User" else "push (read+write)",
@@ -1081,25 +842,22 @@ async def batch_add_collaborators(
 
 @mcp.tool()
 @protected
-async def batch_remove_collaborators(
-    owner: str,
+async def remove_collaborators(
     repo: str,
     usernames: str
 ) -> List[TextContent]:
     """
-    Remove multiple collaborators from a repository in one call.
+    Remove collaborators from a repository.
 
     Args:
-        owner: Repository owner
         repo: Repository name
-        usernames: Comma-separated GitHub usernames (e.g., "user1,user2,user3")
+        usernames: Comma-separated GitHub usernames (e.g., "user1" or "user1,user2,user3")
     """
-    if not validate_username(owner):
-        return ToolResult(
-            success=False,
-            error_code=ErrorCode.VALIDATION_ERROR.value,
-            error_message="Invalid owner name"
-        ).to_response()
+    # Get token owner
+    token_info = await github.get_token_info()
+    if not token_info.success:
+        return token_info.to_response()
+    owner = token_info.data["owner"]
 
     if not validate_repo_name(repo):
         return ToolResult(
@@ -1148,36 +906,11 @@ async def batch_remove_collaborators(
             failed.append({"username": item["username"], "error": item["error"]})
 
     return ToolResult(success=True, data={
-        "action": "batch_removed",
+        "action": "removed",
         "repository": f"{owner}/{repo}",
         "total_requested": len(user_list),
         "successful": successful,
         "failed": failed
-    }).to_response()
-
-
-@mcp.tool()
-async def security_status() -> List[TextContent]:
-    """
-    View current security configuration (whitelist, rate limit, audit log).
-    """
-    token_info = await github.get_token_info()
-    token_owner = token_info.data.get("owner", "unknown") if token_info.success else "unknown"
-
-    return ToolResult(success=True, data={
-        "token_owner": token_owner,
-        "security_config": {
-            "repo_whitelist": config.allowed_repo_patterns,
-            "rate_limit": f"{config.max_requests_per_minute} requests/minute",
-            "audit_log": config.audit_log_path
-        },
-        "active_protections": [
-            "Input validation",
-            "Repository whitelist",
-            "Rate limiting",
-            "Audit logging",
-            "GitHub token scope enforcement"
-        ]
     }).to_response()
 
 
@@ -1264,99 +997,22 @@ async def get_user_info(
 
 
 @mcp.tool()
-async def review_user_repo_activity(
-    owner: str,
-    repo: str,
-    username: str,
-    since: str = None,
-    until: str = None,
-    per_page: int = 30
-) -> List[TextContent]:
-    """
-    Review user activity on a specific repository.
-
-    Args:
-        owner: Repository owner
-        repo: Repository name
-        username: GitHub username to check
-        since: Filter commits after this date (ISO 8601)
-        until: Filter commits before this date (ISO 8601)
-        per_page: Number of commits to return (default: 30, max: 100)
-    """
-    if not validate_username(owner):
-        return ToolResult(
-            success=False,
-            error_code=ErrorCode.VALIDATION_ERROR.value,
-            error_message="Invalid owner name"
-        ).to_response()
-
-    if not validate_repo_name(repo):
-        return ToolResult(
-            success=False,
-            error_code=ErrorCode.VALIDATION_ERROR.value,
-            error_message="Invalid repository name"
-        ).to_response()
-
-    if not username or len(username) > 100:
-        return ToolResult(
-            success=False,
-            error_code=ErrorCode.VALIDATION_ERROR.value,
-            error_message="Invalid username"
-        ).to_response()
-
-    per_page = min(max(1, per_page), 100)
-
-    params = {
-        "author": username,
-        "per_page": per_page
-    }
-
-    if since:
-        params["since"] = since
-    if until:
-        params["until"] = until
-
-    result = await github.request(
-        "GET",
-        f"/repos/{owner}/{repo}/commits",
-        params=params
-    )
-
-    if not result.success:
-        return result.to_response()
-
-    commits = [{
-        "sha": c["sha"][:7],
-        "message": c["commit"]["message"].split("\n")[0],
-        "author_name": c["commit"]["author"]["name"],
-        "author_email": c["commit"]["author"]["email"],
-        "date": c["commit"]["author"]["date"],
-        "url": c["html_url"]
-    } for c in result.data]
-
-    return ToolResult(success=True, data={
-        "repository": f"{owner}/{repo}",
-        "username": username,
-        "total": len(commits),
-        "commits": commits
-    }).to_response()
-
-
-@mcp.tool()
 async def review_user_activity(
     username: str,
+    repo: str = None,
     since: str = None,
     until: str = None,
     max_repos: int = 20
 ) -> List[TextContent]:
     """
-    Review user activity across ALL repositories (for periodic review).
+    Review user activity on a specific repository or across all repositories.
 
     Args:
         username: GitHub username to check
+        repo: Repository name (optional). If not specified, reviews activity across all repos.
         since: Filter commits after this date (ISO 8601)
         until: Filter commits before this date (ISO 8601)
-        max_repos: Max repos to check (default: 20, max: 50)
+        max_repos: Max repos to check when repo is not specified (default: 20, max: 50)
     """
     if not username or len(username) > 100:
         return ToolResult(
@@ -1364,8 +1020,6 @@ async def review_user_activity(
             error_code=ErrorCode.VALIDATION_ERROR.value,
             error_message="Invalid username"
         ).to_response()
-
-    max_repos = min(max(1, max_repos), 50)
 
     # Get token owner info
     token_info = await github.get_token_info()
@@ -1374,7 +1028,49 @@ async def review_user_activity(
 
     owner = token_info.data["owner"]
 
-    # Get list of repos
+    # Single repo mode
+    if repo:
+        if not validate_repo_name(repo):
+            return ToolResult(
+                success=False,
+                error_code=ErrorCode.VALIDATION_ERROR.value,
+                error_message="Invalid repository name"
+            ).to_response()
+
+        params = {"author": username, "per_page": 30}
+        if since:
+            params["since"] = since
+        if until:
+            params["until"] = until
+
+        result = await github.request(
+            "GET",
+            f"/repos/{owner}/{repo}/commits",
+            params=params
+        )
+
+        if not result.success:
+            return result.to_response()
+
+        commits = [{
+            "sha": c["sha"][:7],
+            "message": c["commit"]["message"].split("\n")[0],
+            "author_name": c["commit"]["author"]["name"],
+            "author_email": c["commit"]["author"]["email"],
+            "date": c["commit"]["author"]["date"],
+            "url": c["html_url"]
+        } for c in result.data]
+
+        return ToolResult(success=True, data={
+            "repository": f"{owner}/{repo}",
+            "username": username,
+            "total": len(commits),
+            "commits": commits
+        }).to_response()
+
+    # All repos mode
+    max_repos = min(max(1, max_repos), 50)
+
     repos_result = await github.request(
         "GET",
         f"/users/{owner}/repos",
@@ -1389,7 +1085,6 @@ async def review_user_activity(
     total_commits = 0
     repos_with_commits = []
 
-    # Search commits in each repo IN PARALLEL
     async def fetch_commits(repo_name: str) -> tuple:
         params = {"author": username, "per_page": 10}
         if since:
@@ -1438,35 +1133,178 @@ async def review_user_activity(
     }).to_response()
 
 
+# =============================================================================
+# Repository Management Tools
+# =============================================================================
+
 @mcp.tool()
-async def audit_log_recent(limit: int = 20) -> List[TextContent]:
+async def list_template_repos(owner: str = None, max_repos: int = 50) -> List[TextContent]:
     """
-    View recent audit log entries (operations history).
+    List template repositories available for creating new repositories.
 
     Args:
-        limit: Max entries to return (default: 20)
+        owner: GitHub username or organization to search for templates (optional, defaults to token owner)
+        max_repos: Maximum number of repositories to check (default: 50, max: 100)
     """
-    try:
-        with open(config.audit_log_path, "r") as f:
-            lines = f.readlines()
-            recent = lines[-limit:] if len(lines) > limit else lines
-            logs = []
-            for line in recent:
-                if line.strip():
-                    try:
-                        logs.append(json.loads(line.split(" | ")[-1]))
-                    except:
-                        pass
+    # Get token owner info
+    token_info = await github.get_token_info()
+    if not token_info.success:
+        return token_info.to_response()
 
-        return ToolResult(success=True, data={
-            "total": len(logs),
-            "logs": logs
-        }).to_response()
-    except FileNotFoundError:
-        return ToolResult(success=True, data={
-            "total": 0,
-            "logs": [],
-        }).to_response()
+    # Use token owner if not specified
+    if not owner:
+        owner = token_info.data["owner"]
+    elif not validate_username(owner):
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid username format"
+        ).to_response()
+
+    max_repos = min(max(1, max_repos), 100)
+
+    # Get all repos and filter templates
+    result = await github.request(
+        "GET",
+        f"/users/{owner}/repos",
+        params={"type": "all", "per_page": max_repos, "sort": "updated"}
+    )
+
+    if not result.success:
+        return result.to_response()
+
+    # Filter only template repositories
+    templates = []
+    for repo in result.data:
+        if repo.get("is_template"):
+            templates.append({
+                "full_name": repo["full_name"],
+                "name": repo["name"],
+                "owner": repo["owner"]["login"],
+                "description": repo.get("description", ""),
+                "private": repo.get("private", False),
+                "default_branch": repo.get("default_branch", "main"),
+                "html_url": repo.get("html_url", ""),
+                "clone_url": repo.get("clone_url", ""),
+                "updated_at": repo.get("updated_at", ""),
+                "language": repo.get("language", ""),
+                "topics": repo.get("topics", [])
+            })
+
+    return ToolResult(success=True, data={
+        "owner": owner,
+        "total_repos_checked": len(result.data),
+        "total_templates": len(templates),
+        "templates": templates
+    }).to_response()
+
+
+@mcp.tool()
+@protected
+async def create_repo_from_template(
+    template_owner: str,
+    template_repo: str,
+    name: str,
+    description: str = "",
+    private: bool = True,
+    include_all_branches: bool = False
+) -> List[TextContent]:
+    """
+    Create a new repository from a template repository.
+
+    Args:
+        template_owner: Owner of the template repository (username or organization)
+        template_repo: Name of the template repository
+        name: Name for the new repository
+        description: Description for the new repository (optional)
+        private: Whether the new repository should be private (default: True)
+        include_all_branches: Include all branches from template, not just default (default: False)
+    """
+    # Get token owner
+    token_info = await github.get_token_info()
+    if not token_info.success:
+        return token_info.to_response()
+    owner = token_info.data["owner"]
+
+    # Validate inputs
+    if not validate_username(template_owner):
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid template owner name"
+        ).to_response()
+
+    if not validate_repo_name(template_repo):
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid template repository name"
+        ).to_response()
+
+    if not validate_repo_name(name):
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message="Invalid new repository name"
+        ).to_response()
+
+    # Verify template repository exists and is a template
+    verify_result = await github.request(
+        "GET",
+        f"/repos/{template_owner}/{template_repo}"
+    )
+
+    if not verify_result.success:
+        if verify_result.error_code == ErrorCode.NOT_FOUND.value:
+            return ToolResult(
+                success=False,
+                error_code=ErrorCode.NOT_FOUND.value,
+                error_message=f"Template repository '{template_owner}/{template_repo}' not found or not accessible"
+            ).to_response()
+        return verify_result.to_response()
+
+    if not verify_result.data.get("is_template"):
+        return ToolResult(
+            success=False,
+            error_code=ErrorCode.VALIDATION_ERROR.value,
+            error_message=f"Repository '{template_owner}/{template_repo}' is not marked as a template"
+        ).to_response()
+
+    # Create repository from template
+    # API: POST /repos/{template_owner}/{template_repo}/generate
+    result = await github.request(
+        "POST",
+        f"/repos/{template_owner}/{template_repo}/generate",
+        json_data={
+            "owner": owner,
+            "name": name,
+            "description": description,
+            "private": private,
+            "include_all_branches": include_all_branches
+        }
+    )
+
+    if not result.success:
+        return result.to_response()
+
+    repo_data = result.data
+    return ToolResult(success=True, data={
+        "action": "repository_created_from_template",
+        "template": f"{template_owner}/{template_repo}",
+        "new_repository": {
+            "full_name": repo_data.get("full_name"),
+            "name": repo_data.get("name"),
+            "private": repo_data.get("private"),
+            "description": repo_data.get("description"),
+            "html_url": repo_data.get("html_url"),
+            "clone_url": repo_data.get("clone_url"),
+            "ssh_url": repo_data.get("ssh_url"),
+            "default_branch": repo_data.get("default_branch"),
+            "created_at": repo_data.get("created_at")
+        },
+        "owner": owner,
+        "include_all_branches": include_all_branches
+    }).to_response()
 
 
 # =============================================================================
@@ -1476,7 +1314,6 @@ async def audit_log_recent(limit: int = 20) -> List[TextContent]:
 if __name__ == "__main__":
     print("GitHub User Management MCP Server")
     print("=" * 50)
-    print(f"Repo whitelist: {config.allowed_repo_patterns}")
     print(f"Rate limit: {config.max_requests_per_minute} req/min")
     print(f"Audit log: {config.audit_log_path}")
     print("=" * 50)

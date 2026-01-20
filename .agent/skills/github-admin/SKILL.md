@@ -11,8 +11,7 @@ Quản lý quyền truy cập repo via MCP github-admin.
 
 ## Quick Start
 
-**Bước đầu tiên BẮT BUỘC:**
-Chạy `quick_overview` để lấy thông tin account + collaborators + invitations.
+`mcp__github-admin__quick_overview` → Lấy thông tin account + collaborators + invitations.
 
 ## Workflows
 
@@ -45,19 +44,17 @@ Chạy `quick_overview` để lấy thông tin account + collaborators + invitat
 ## Key Patterns
 
 **Single vs All repos:** `list_collaborators`, `list_pending_invitations`, `review_user_activity` có optional `repo`:
-
 - Có `repo`: chỉ 1 repo
 - Không có `repo`: scan tất cả repos
 
 **Verify trước khi action:**
-
 - Thêm: `get_user_info` để verify username tồn tại
 - Xóa: `review_user_activity` để check còn hoạt động không
 
 ## Error Handling
 
-| Error               | Cách xử lý                               |
-| ------------------- | ---------------------------------------- |
-| `PERMISSION_DENIED` | Kiểm tra admin rights, token scopes      |
-| `NOT_FOUND`         | Verify username/repo qua `get_user_info` |
-| `RATE_LIMITED`      | Giảm `max_repos` parameter               |
+| Error | Cách xử lý |
+|-------|------------|
+| `PERMISSION_DENIED` | Kiểm tra admin rights, token scopes |
+| `NOT_FOUND` | Verify username/repo qua `get_user_info` |
+| `RATE_LIMITED` | Giảm `max_repos` parameter |
